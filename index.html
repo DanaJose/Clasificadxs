@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>¿Hablamos?</title>
+<style>
+  :root { --rojo:#ff003c; --verde:#00ff46; }
+  html, body { margin:0; height:100%; background:#000; color:var(--verde); font-family:"Courier New", monospace; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; }
+  #inicio { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:1.2rem; background:#000; text-align:center; padding:1.5rem; }
+  #inicio h1 { margin:0; font-size:clamp(2.2rem, 9vw, 5.5rem); color:var(--rojo); }
+  #inicio p { margin:0; max-width:34rem; line-height:1.5; }
+  #msg { color:var(--rojo); min-height:1.5em; }
+  button { font:inherit; font-weight:bold; font-size:1.05rem; padding:.7rem 1.4rem; color:#000; background:var(--verde); border:0; cursor:pointer; }
+  button:focus-visible, input:focus-visible { outline:3px solid var(--rojo); outline-offset:3px; }
+  #panel { position:fixed; left:1rem; bottom:1rem; display:flex; gap:1rem; align-items:center; flex-wrap:wrap; font-size:.9rem; opacity:.85; }
+  #panel button { font-size:.85rem; padding:.4rem .8rem; }
+  #panel input { width:160px; accent-color:var(--verde); }
+  .oculto { display:none !important; }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="Pantalla de la instalación"></canvas>
+
+<div id="inicio">
+  <h1>¿Hablamos?</h1>
+  <p>Esta pieza escucha tu voz mientras la usás. No graba ni guarda nada: el audio se procesa en este dispositivo, en el momento.</p>
+  <button id="go">Activar micrófono</button>
+  <p id="msg" role="status"></p>
+</div>
+
+<div id="panel" class="oculto">
+  <label>Umbral de voz <input id="umbral" type="range" min="0.002" max="0.2" step="0.001" value="0.02"></label>
+  <button id="pantalla">Pantalla completa</button>
+</div>
+
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H;
+function ajustar() {
+  const d = window.devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  cv.width = W * d; cv.height = H * d;
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+}
+addEventListener('resize', ajustar); ajustar();
+
+const etapas = ["¿HABLAMOS?", "TE ESCUCHO", "TE VEO", "TE SIGO", "SÉ QUIÉN ERES"];
+const datos = ["VOZ REGISTRADA", "PATRÓN VOCAL: ARCHIVADO", "COINCIDENCIA CON BASE DE DATOS: 87%", "ESTADO: SUJETO BAJO OBSERVACIÓN"];
+const cortes = [1, 4, 7, 10];          // segundos hablando para pasar de etapa
+let sujeto = 417, voz = 0, tiempo = 0, umbral = 0.02, analyser, buf, last = performance.now();
+
+const slider = document.getElementById('umbral');
+slider.oninput = () => { umbral = parseFloat(slider.value); };
+
+document.getElementById('pantalla').onclick = () => document.documentElement.requestFullscreen?.();
+
+document.getElementById('go').onclick = async () => {
+  const msg = document.getElementById('msg');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    await ac.resume();
+    analyser = ac.createAnalyser();
+    analyser.fftSize = 1024;
+    ac.createMediaStreamSource(stream).connect(analyser);
+    buf = new Float32Array(analyser.fftSize);
+    document.getElementById('inicio').classList.add('oculto');
+    document.getElementById('panel').classList.remove('oculto');
+    last = performance.now();
+    requestAnimationFrame(dibujar);
+  } catch (e) {
+    msg.textContent = "No se pudo activar el micrófono. Permitilo en el navegador y tocá de nuevo.";
+  }
+};
+
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowUp') umbral += 0.005;
+  else if (e.key === 'ArrowDown') umbral = Math.max(0.002, umbral - 0.005);
+  else sujeto = 1000 + Math.floor(Math.random() * 9000);
+  slider.value = umbral;
+});
+
+function nivel() {
+  analyser.getFloatTimeDomainData(buf);
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+  return Math.sqrt(s / buf.length);
+}
+
+function dibujar(t) {
+  const dt = Math.min((t - last) / 1000, 0.1); last = t;
+  voz += (nivel() - voz) * 0.2;
+  const habla = voz > umbral;
+  tiempo = habla ? tiempo + dt : Math.max(0, tiempo - dt * 1.5);
+
+  let etapa = 0;
+  cortes.forEach((c, i) => { if (tiempo > c) etapa = i + 1; });
+
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+
+  // palabra central: crece con el tiempo y se ajusta al ancho
+  const palabra = etapas[etapa];
+  let tam = 70 + Math.min(tiempo, 12) / 12 * 190;
+  ctx.font = `bold ${tam}px "Courier New", monospace`;
+  const w = ctx.measureText(palabra).width;
+  if (w > W * 0.9) { tam *= (W * 0.9) / w; ctx.font = `bold ${tam}px "Courier New", monospace`; }
+  const tem = tiempo * 1.5;
+  ctx.fillStyle = Math.random() < 0.12 ? '#00ff46' : '#ff003c';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(palabra, W / 2 + (Math.random() * 2 - 1) * tem, H / 2 + (Math.random() * 2 - 1) * tem);
+
+  // glitch: más barras en las etapas altas
+  for (let i = 0; i < etapa * 2; i++) {
+    ctx.fillStyle = 'rgba(255,0,60,0.47)';
+    ctx.fillRect(0, Math.random() * H, W, 2 + Math.random() * 12);
+  }
+
+  // panel de datos
+  ctx.fillStyle = '#00ff46'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  const f = W < 600 ? 13 : 18;
+  ctx.font = `${f}px "Courier New", monospace`;
+  ctx.fillText(`SUJETO-${String(sujeto).padStart(4, '0')}   NIVEL VOZ: ${voz.toFixed(3)}   UMBRAL: ${umbral.toFixed(3)}`, 20, 20);
+  for (let i = 0; i < etapa; i++) ctx.fillText(datos[i], 20, 20 + f * 2 + i * f * 1.5);
+
+  requestAnimationFrame(dibujar);
+}
+</script>
+</body>
+</html>
