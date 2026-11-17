@@ -17,26 +17,33 @@
   #panel { position:fixed; left:1rem; bottom:1rem; display:flex; gap:1rem; align-items:center; flex-wrap:wrap; font-size:.9rem; opacity:.85; }
   #panel button { font-size:.85rem; padding:.4rem .8rem; }
   #panel input { width:160px; accent-color:var(--verde); }
+  #v { position:fixed; right:1rem; bottom:1rem; width:2px; height:2px; opacity:.01; pointer-events:none; transform:scaleX(-1); }
+  #v.ver { width:200px; height:auto; opacity:1; border:2px solid var(--verde); }
   .oculto { display:none !important; }
 </style>
 </head>
 <body>
 <canvas id="c" aria-label="Pantalla de la instalación"></canvas>
+<video id="v" playsinline muted></video>
 
 <div id="inicio">
   <h1>¿Hablamos?</h1>
-  <p>Esta pieza escucha tu voz mientras la usás. No graba ni guarda nada: el audio se procesa en este dispositivo, en el momento.</p>
+  <p>Esta pieza escucha tu voz y, si lo activás, mira tu rostro. No graba ni guarda nada: todo se procesa en este dispositivo, en el momento.</p>
   <button id="go">Activar micrófono</button>
   <p id="msg" role="status"></p>
 </div>
 
 <div id="panel" class="oculto">
   <label>Umbral de voz <input id="umbral" type="range" min="0.002" max="0.2" step="0.001" value="0.02"></label>
+  <button id="camBtn">Activar cámara</button>
+  <button id="verBtn" class="oculto">Ver cámara</button>
   <button id="pantalla">Pantalla completa</button>
+  <span id="estado" role="status"></span>
 </div>
 
 <script>
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const video = document.getElementById('v'), estado = document.getElementById('estado');
 let W, H;
 function ajustar() {
   const d = window.devicePixelRatio || 1;
@@ -46,18 +53,51 @@ function ajustar() {
 }
 addEventListener('resize', ajustar); ajustar();
 
-const etapas = ["¿HABLAMOS?", "TE ESCUCHO", "TE VEO", "TE SIGO", "SÉ QUIÉN ERES"];
+// Frases por etapa (0 a 4). "sube": al avanzar, mientras seguís hablando o mirando.
+// "baja": al retroceder, cuando te callás. Hay varias por etapa y no se repite la última usada.
+const frases = {
+  sube: [
+    ["¿HABLAMOS?"],
+    ["TE ESCUCHO", "CONTINUÁ, ME INTERESA", "SEGUÍ HABLANDO"],
+    ["TE VEO", "TE ESTOY MIRANDO", "YA TE TENGO"],
+    ["TE SIGO", "NO PODÉS IRTE", "ESTOY CERCA"],
+    ["SÉ QUIÉN ERES", "SÉ DÓNDE ESTÁS", "YA SÉ TODO DE VOS"]
+  ],
+  baja: [
+    ["¿POR QUÉ TE CALLASTE?", "NO TE VAYAS", "¿QUÉ ESTÁS ESCONDIENDO?"],
+    ["¿POR QUÉ PARÁS?", "NO TE DETENGAS", "TENGO TIEMPO"],
+    ["VOLVÉ A HABLAR", "TODAVÍA TE VEO", "NO ME DEJES AFUERA"],
+    ["NO TE ESCAPES", "TODAVÍA TE SIGO", "NO TE ALEJES"],
+    ["SÉ QUIÉN ERES"]
+  ]
+};
+// Final: se dispara al sostener la etapa 4 (la etapa 4 empieza en 10 s, el final llega en TIEMPO_FINAL).
+const TIEMPO_FINAL = 18;
+const textosFinal = [
+  "ESCANEO COMPLETO.",
+  "SUJETO-{S} IDENTIFICADO.",
+  "TUS DATOS FUERON ARCHIVADOS.",
+  "NADIE TE PREGUNTÓ."
+];
+const cierre = "VIGILAR NO ES CUIDAR.";
 const datos = ["VOZ REGISTRADA", "PATRÓN VOCAL: ARCHIVADO", "COINCIDENCIA CON BASE DE DATOS: 87%", "ESTADO: SUJETO BAJO OBSERVACIÓN"];
-const cortes = [1, 4, 7, 10];          // segundos hablando para pasar de etapa
-let sujeto = 417, voz = 0, tiempo = 0, umbral = 0.02, analyser, buf, last = performance.now();
+const cortes = [1, 4, 7, 10];                  // segundos para pasar de etapa
+const textoIzquierda = "¿A DÓNDE VAS?";        // cuando la persona gira la cabeza a su izquierda
+const textoDerecha = "NO TE ESCAPES";          // cuando la gira a su derecha
+
+let sujeto = 417, voz = 0, tiempo = 0, tiempoFijo = 0, umbral = 0.02;
+let analyser, buf, last = performance.now();
+let landmarker, camActiva = false, ultimaDet = 0, lastVT = -1;
+let rostro = false, r = 0.5, caja = null, invertir = false;
+let etapaPrev = 0, palabra = frases.sube[0][0], tReposo = 0, modo = 'juego', segFinal = 0;
+const ultimo = {};
 
 const slider = document.getElementById('umbral');
 slider.oninput = () => { umbral = parseFloat(slider.value); };
-
 document.getElementById('pantalla').onclick = () => document.documentElement.requestFullscreen?.();
+document.getElementById('verBtn').onclick = () => video.classList.toggle('ver');
 
 document.getElementById('go').onclick = async () => {
-  const msg = document.getElementById('msg');
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
@@ -73,13 +113,46 @@ document.getElementById('go').onclick = async () => {
     last = performance.now();
     requestAnimationFrame(dibujar);
   } catch (e) {
-    msg.textContent = "No se pudo activar el micrófono. Permitilo en el navegador y tocá de nuevo.";
+    document.getElementById('msg').textContent = "No se pudo activar el micrófono. Permitilo en el navegador y tocá de nuevo.";
+  }
+};
+
+// Detector de rostro (MediaPipe Face Landmarker, corre en el navegador)
+const LIB = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODELO = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+
+document.getElementById('camBtn').onclick = async (ev) => {
+  ev.target.disabled = true;
+  estado.textContent = "Cargando detector de rostro…";
+  try {
+    const { FaceLandmarker, FilesetResolver } = await import(LIB);
+    const fileset = await FilesetResolver.forVisionTasks(WASM);
+    const base = { modelAssetPath: MODELO };
+    try {
+      landmarker = await FaceLandmarker.createFromOptions(fileset, { baseOptions: { ...base, delegate: "GPU" }, runningMode: "VIDEO", numFaces: 1 });
+    } catch (e) {
+      landmarker = await FaceLandmarker.createFromOptions(fileset, { baseOptions: base, runningMode: "VIDEO", numFaces: 1 });
+    }
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: "user" } });
+    await video.play();
+    camActiva = true;
+    estado.textContent = "Cámara activa";
+    document.getElementById('verBtn').classList.remove('oculto');
+    ev.target.classList.add('oculto');
+  } catch (e) {
+    console.error(e);
+    estado.textContent = "No se pudo activar la cámara. Revisá el permiso y la conexión a internet.";
+    ev.target.disabled = false;
   }
 };
 
 addEventListener('keydown', e => {
   if (e.key === 'ArrowUp') umbral += 0.005;
   else if (e.key === 'ArrowDown') umbral = Math.max(0.002, umbral - 0.005);
+  else if (e.key === 'i') invertir = !invertir;       // invierte izquierda/derecha si quedan al revés
+  else if (e.key === 'v') video.classList.toggle('ver');
+  else if (e.key === 'f') { modo = 'final'; segFinal = 0; }   // prueba el final
   else sujeto = 1000 + Math.floor(Math.random() * 9000);
   slider.value = umbral;
 });
@@ -91,40 +164,132 @@ function nivel() {
   return Math.sqrt(s / buf.length);
 }
 
+function detectar(t) {
+  if (!camActiva || video.readyState < 2 || t - ultimaDet < 66 || video.currentTime === lastVT) return;
+  ultimaDet = t; lastVT = video.currentTime;
+  const res = landmarker.detectForVideo(video, t);
+  if (res.faceLandmarks && res.faceLandmarks.length) {
+    const lm = res.faceLandmarks[0];
+    rostro = true;
+    r = (lm[1].x - lm[234].x) / (lm[454].x - lm[234].x);   // 0,5 = cabeza de frente
+    caja = { x1: lm[234].x, x2: lm[454].x, y1: lm[10].y, y2: lm[152].y };
+  } else { rostro = false; caja = null; }
+}
+
+function elegir(dir, etapa) {
+  const pool = frases[dir][etapa], k = dir + etapa;
+  let i = Math.floor(Math.random() * pool.length);
+  if (pool.length > 1 && i === ultimo[k]) i = (i + 1 + Math.floor(Math.random() * (pool.length - 1))) % pool.length;
+  ultimo[k] = i;
+  return pool[i];
+}
+
+function reiniciar() {
+  tiempo = 0; tiempoFijo = 0; etapaPrev = 0; tReposo = 0; modo = 'juego';
+  palabra = frases.sube[0][0];
+  sujeto = 1000 + Math.floor(Math.random() * 9000);
+}
+
+function dibujarFinal() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  if (segFinal < 1.5) {                              // apagón con glitch
+    for (let i = 0; i < 14; i++) { ctx.fillStyle = 'rgba(255,0,60,0.5)'; ctx.fillRect(0, Math.random() * H, W, 2 + Math.random() * 16); }
+    return;
+  }
+  const f = Math.min(30, W * 0.035), paso = 2.2;
+  ctx.font = `${f}px "Courier New", monospace`;
+  ctx.fillStyle = '#00ff46'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  textosFinal.forEach((l, i) => {
+    const linea = l.replace('{S}', String(sujeto).padStart(4, '0'));
+    const n = Math.floor((segFinal - 1.5 - i * paso) * 30);   // efecto de tipeo
+    if (n > 0) ctx.fillText(linea.slice(0, n), W * 0.08, H * 0.18 + i * f * 1.8);
+  });
+  const inicioCierre = 1.5 + textosFinal.length * paso;
+  if (segFinal > inicioCierre) {
+    let tam = Math.min(110, W * 0.09);
+    ctx.font = `bold ${tam}px "Courier New", monospace`;
+    const w = ctx.measureText(cierre).width;
+    if (w > W * 0.9) { tam *= (W * 0.9) / w; ctx.font = `bold ${tam}px "Courier New", monospace`; }
+    ctx.fillStyle = '#ff003c'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(cierre, W / 2 + (Math.random() * 2 - 1) * 3, H * 0.68);
+  }
+  if (segFinal > inicioCierre + 8) reiniciar();      // vuelve a empezar solo
+}
+
 function dibujar(t) {
   const dt = Math.min((t - last) / 1000, 0.1); last = t;
+  if (modo === 'final') { segFinal += dt; dibujarFinal(); requestAnimationFrame(dibujar); return; }
   voz += (nivel() - voz) * 0.2;
   const habla = voz > umbral;
   tiempo = habla ? tiempo + dt : Math.max(0, tiempo - dt * 1.5);
 
+  detectar(t);
+  const d = (r - 0.5) * (invertir ? -1 : 1);
+  const lado = !rostro ? '—' : d > 0.12 ? 'izquierda' : d < -0.12 ? 'derecha' : 'centro';
+  const fijo = rostro && Math.abs(r - 0.5) < 0.08;
+  tiempoFijo = fijo ? tiempoFijo + dt : Math.max(0, tiempoFijo - dt * 1.5);
+
+  const tEf = Math.max(tiempo, tiempoFijo);     // la voz y la mirada fija hacen avanzar las etapas
   let etapa = 0;
-  cortes.forEach((c, i) => { if (tiempo > c) etapa = i + 1; });
+  cortes.forEach((c, i) => { if (tEf > c) etapa = i + 1; });
+
+  if (tEf > TIEMPO_FINAL) { modo = 'final'; segFinal = 0; }
+  if (etapa !== etapaPrev) { palabra = elegir(etapa > etapaPrev ? 'sube' : 'baja', etapa); etapaPrev = etapa; }
+  if (etapa === 0 && tEf < 0.01) { tReposo += dt; if (tReposo > 12) palabra = frases.sube[0][0]; } else tReposo = 0;
 
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
 
-  // palabra central: crece con el tiempo y se ajusta al ancho
-  const palabra = etapas[etapa];
-  let tam = 70 + Math.min(tiempo, 12) / 12 * 190;
+  // palabra central
+  let tam = 70 + Math.min(tEf, 12) / 12 * 190;
   ctx.font = `bold ${tam}px "Courier New", monospace`;
   const w = ctx.measureText(palabra).width;
   if (w > W * 0.9) { tam *= (W * 0.9) / w; ctx.font = `bold ${tam}px "Courier New", monospace`; }
-  const tem = tiempo * 1.5;
+  const tem = tEf * 1.5;
   ctx.fillStyle = Math.random() < 0.12 ? '#00ff46' : '#ff003c';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(palabra, W / 2 + (Math.random() * 2 - 1) * tem, H / 2 + (Math.random() * 2 - 1) * tem);
 
-  // glitch: más barras en las etapas altas
+  // texto lateral según hacia dónde gira la cabeza (la pantalla funciona como espejo)
+  if (lado === 'izquierda' || lado === 'derecha') {
+    ctx.font = `bold ${Math.min(60, W * 0.06)}px "Courier New", monospace`;
+    ctx.fillStyle = '#ff003c';
+    if (lado === 'izquierda') { ctx.textAlign = 'left'; ctx.fillText(textoIzquierda, 30, H * 0.8); }
+    else { ctx.textAlign = 'right'; ctx.fillText(textoDerecha, W - 30, H * 0.8); }
+  }
+
+  // recuadro de escaneo sobre el rostro (en espejo)
+  const f = W < 600 ? 13 : 18;
+  if (rostro && caja) {
+    const x1 = (1 - caja.x2) * W, x2 = (1 - caja.x1) * W, y1 = caja.y1 * H, y2 = caja.y2 * H;
+    ctx.strokeStyle = '#00ff46'; ctx.lineWidth = 3;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.fillStyle = '#00ff46'; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+    ctx.font = `${f}px "Courier New", monospace`;
+    ctx.fillText(`SUJETO-${String(sujeto).padStart(4, '0')}  RIESGO: ${Math.min(99, Math.round(tEf * 9))}%`, x1, y1 - 8);
+  }
+
+  // glitch
   for (let i = 0; i < etapa * 2; i++) {
     ctx.fillStyle = 'rgba(255,0,60,0.47)';
     ctx.fillRect(0, Math.random() * H, W, 2 + Math.random() * 12);
   }
 
-  // panel de datos
+  // datos
   ctx.fillStyle = '#00ff46'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-  const f = W < 600 ? 13 : 18;
   ctx.font = `${f}px "Courier New", monospace`;
   ctx.fillText(`SUJETO-${String(sujeto).padStart(4, '0')}   NIVEL VOZ: ${voz.toFixed(3)}   UMBRAL: ${umbral.toFixed(3)}`, 20, 20);
   for (let i = 0; i < etapa; i++) ctx.fillText(datos[i], 20, 20 + f * 2 + i * f * 1.5);
+  if (camActiva) {
+    ctx.textAlign = 'right';
+    ctx.fillText(`ROSTRO: ${rostro ? 'DETECTADO' : 'NO DETECTADO'}`, W - 20, 20);
+    ctx.fillText(`CABEZA: ${lado}  (${r.toFixed(2)})`, W - 20, 20 + f * 1.5);
+    ctx.fillText(`MIRADA FIJA: ${tiempoFijo.toFixed(1)} s`, W - 20, 20 + f * 3);
+  }
+
+  if (etapa === 4) {                                 // barra que anticipa el final
+    const p = Math.min(1, (tEf - cortes[3]) / (TIEMPO_FINAL - cortes[3]));
+    ctx.fillStyle = '#ff003c'; ctx.fillRect(0, H - 8, W * p, 8);
+  }
 
   requestAnimationFrame(dibujar);
 }
